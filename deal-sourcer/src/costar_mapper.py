@@ -76,6 +76,109 @@ def _derive_asset_type(secondary_type: str) -> str:
     return "conventional"
 
 
+def estimate_missing_rents(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Estimate rent for properties where current_rent_per_unit is null/zero.
+
+    Uses a two-step comp approach:
+      Step 1 — Market + vintage band (±5 years), requires 3+ comps.
+      Step 2 — Market average regardless of vintage (1+ comps).
+      Step 3 — No comps available; leaves rent as 0.
+
+    Adds three tracking columns to the DataFrame:
+      rent_estimated  (bool)   — True if rent was estimated
+      rent_method     (str)    — "actual" / "estimated_market_vintage" /
+                                 "estimated_market_avg" / "no_rent_data"
+      rent_comp_count (int)    — Number of comps used (0 for actual/no_data)
+
+    Updates the "notes" column for estimated properties.
+
+    Args:
+        df: DataFrame with current_rent_per_unit (numeric), market,
+            vintage (numeric), and notes columns already present.
+
+    Returns:
+        DataFrame with rent gaps filled and tracking columns added.
+    """
+    VINTAGE_BAND = 5
+    MIN_COMPS_VINTAGE = 3
+
+    # Initialize tracking columns
+    df["rent_estimated"] = False
+    df["rent_method"] = "actual"
+    df["rent_comp_count"] = 0
+
+    # Build comp pool: all rows that already have real rent data
+    has_rent = df["current_rent_per_unit"].notna() & (df["current_rent_per_unit"] > 0)
+    comp_pool = df.loc[has_rent, ["market", "vintage", "current_rent_per_unit"]].copy()
+
+    # Pre-build market-level rent lists for fast lookup
+    market_rents: dict[str, list[float]] = {}
+    for _, row in comp_pool.iterrows():
+        mkt = str(row["market"]).strip().lower()
+        market_rents.setdefault(mkt, []).append(float(row["current_rent_per_unit"]))
+
+    missing_mask = df["current_rent_per_unit"].isna() | (df["current_rent_per_unit"] == 0)
+    missing_idx = df.index[missing_mask].tolist()
+
+    counts = {"estimated_market_vintage": 0, "estimated_market_avg": 0, "no_rent_data": 0}
+
+    for idx in missing_idx:
+        subject_market = str(df.at[idx, "market"]).strip().lower()
+        subject_vintage = df.at[idx, "vintage"]
+
+        # --- Step 1: market + vintage band ---
+        vintage_comps = comp_pool[
+            (comp_pool["market"].str.strip().str.lower() == subject_market)
+            & (comp_pool["vintage"].notna())
+            & (abs(comp_pool["vintage"] - subject_vintage) <= VINTAGE_BAND)
+        ]["current_rent_per_unit"].tolist()
+
+        if len(vintage_comps) >= MIN_COMPS_VINTAGE:
+            avg = round(sum(vintage_comps) / len(vintage_comps), 0)
+            df.at[idx, "current_rent_per_unit"] = avg
+            df.at[idx, "rent_estimated"] = True
+            df.at[idx, "rent_method"] = "estimated_market_vintage"
+            df.at[idx, "rent_comp_count"] = len(vintage_comps)
+            df.at[idx, "notes"] = (
+                str(df.at[idx, "notes"]).replace("NO RENT DATA; ", "").strip("; ")
+                + f"; Rent estimated from {len(vintage_comps)} market+vintage comps (avg ${avg:,.0f})"
+            ).lstrip("; ")
+            counts["estimated_market_vintage"] += 1
+            continue
+
+        # --- Step 2: market average fallback ---
+        mkt_rents = market_rents.get(subject_market, [])
+        if mkt_rents:
+            avg = round(sum(mkt_rents) / len(mkt_rents), 0)
+            df.at[idx, "current_rent_per_unit"] = avg
+            df.at[idx, "rent_estimated"] = True
+            df.at[idx, "rent_method"] = "estimated_market_avg"
+            df.at[idx, "rent_comp_count"] = len(mkt_rents)
+            df.at[idx, "notes"] = (
+                str(df.at[idx, "notes"]).replace("NO RENT DATA; ", "").strip("; ")
+                + f"; Rent estimated from {len(mkt_rents)} market comps, no vintage match (avg ${avg:,.0f})"
+            ).lstrip("; ")
+            counts["estimated_market_avg"] += 1
+            continue
+
+        # --- Step 3: no comps available ---
+        df.at[idx, "current_rent_per_unit"] = 0
+        df.at[idx, "rent_method"] = "no_rent_data"
+        df.at[idx, "rent_comp_count"] = 0
+        counts["no_rent_data"] += 1
+
+    actual_ct = has_rent.sum()
+    print(f"\n[Mapper] Rent estimation summary:")
+    print(f"  Actual rent data             : {actual_ct}")
+    print(f"  Estimated (market+vintage)   : {counts['estimated_market_vintage']}")
+    print(f"  Estimated (market avg)       : {counts['estimated_market_avg']}")
+    print(f"  No rent data (no comps)      : {counts['no_rent_data']}")
+    print(f"  Total                        : {len(df)}")
+
+    return df
+
+
 def map_costar_export(input_path: str, output_path: str) -> pd.DataFrame:
     """
     Read a CoStar xlsx export, map columns, clean/filter, fill defaults,
@@ -185,12 +288,20 @@ def map_costar_export(input_path: str, output_path: str) -> pd.DataFrame:
     )
     print(f"[Mapper] Vacancy: {missing_vac.sum()} missing -> defaulted to 0.94 occupancy")
 
-    # current_rent_per_unit -- flag nulls
+    # current_rent_per_unit -- convert to numeric, then estimate missing via comps
     df["current_rent_per_unit"] = pd.to_numeric(df["current_rent_per_unit"], errors="coerce")
-    missing_rent = df["current_rent_per_unit"].isna()
-    df.loc[missing_rent, "notes"] += "NO RENT DATA; "
-    df.loc[missing_rent, "current_rent_per_unit"] = 0
-    print(f"[Mapper] Rent: {missing_rent.sum()} missing -> set to 0, flagged NO RENT DATA")
+    # vintage must already be numeric for vintage-band matching
+    df["vintage"] = pd.to_numeric(df["vintage"], errors="coerce")
+    missing_rent_ct = df["current_rent_per_unit"].isna().sum()
+    print(f"[Mapper] Rent: {missing_rent_ct} missing -> running estimate_missing_rents()")
+    df = estimate_missing_rents(df)
+    # Any still-missing (no_rent_data) remain 0; flag in notes
+    still_missing = df["current_rent_per_unit"].isna() | (
+        (df["current_rent_per_unit"] == 0) & (df["rent_method"] == "no_rent_data")
+    )
+    df.loc[still_missing & ~df["notes"].str.contains("NO RENT DATA", na=False),
+           "notes"] += "NO RENT DATA; "
+    df.loc[df["current_rent_per_unit"].isna(), "current_rent_per_unit"] = 0
 
     # asking_price -- null = solve for max bid
     df["asking_price"] = pd.to_numeric(df["asking_price"], errors="coerce")
@@ -226,6 +337,7 @@ def map_costar_export(input_path: str, output_path: str) -> pd.DataFrame:
         "re_tax_annual", "noi_t12", "loan_maturity_date", "debt_type",
         "building_class", "secondary_type", "building_status",
         "concessions_pct", "year_renovated", "owner_name", "property_manager",
+        "rent_estimated", "rent_method", "rent_comp_count",
         "notes",
     ]
     # Keep only columns that exist
