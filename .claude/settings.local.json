@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python run.py --file data/imports/sample_import_template.csv)",
+      "Bash(python -c ':*)",
+      "Bash(python src/costar_mapper.py --file \"data/imports/CostarExport \\(26\\).xlsx\")",
+      "Bash(python run.py --file data/imports/costar_mapped.csv)"
+    ]
+  }
+}
