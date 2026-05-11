@@ -86,8 +86,21 @@ def main():
     # -------------------------------------------------------------------
     # Step 4: Generate reports
     # -------------------------------------------------------------------
-    print("\n[Pipeline] Step 4/4 — Generating reports...")
-    xlsx_path, txt_path = generate_reports(df, args.output_dir)
+    print("\n[Pipeline] Step 4/4 -- Generating reports...")
+
+    # Extract live treasury info from first underwritten row
+    meta = {"run_ts": datetime.now().strftime("%Y-%m-%d %H:%M")}
+    uw_rows = df[df["pipeline_status"].isin(["PASS", "POSSIBLE", "FAIL"])]
+    if len(uw_rows) > 0:
+        first = uw_rows.iloc[0]
+        if "treasury_rate" in first and first["treasury_rate"] is not None:
+            meta["treasury_rate"] = first["treasury_rate"]
+        if "loan_rate" in first and first["loan_rate"] is not None:
+            meta["loan_rate"] = first["loan_rate"]
+        if "treasury_source" in first and first["treasury_source"] is not None:
+            meta["treasury_source"] = str(first["treasury_source"])
+
+    xlsx_path, txt_path = generate_reports(df, args.output_dir, meta=meta)
 
     # -------------------------------------------------------------------
     # Console summary
@@ -114,14 +127,22 @@ def main():
         print("\n  --- PASS DEALS ---")
         pass_df = df[df["pipeline_status"] == "PASS"]
         for _, row in pass_df.iterrows():
-            bid = row.get("asking_price") or row.get("max_bid")
+            bid = row.get("max_bid") or row.get("asking_price")
+            bpu = row.get("max_bid_per_unit")
             bid_str = f"${bid:,.0f}" if bid and str(bid) != "nan" else "N/A"
+            bpu_str = f" (${bpu:,.0f}/unit)" if bpu and str(bpu) != "nan" else ""
             irr = row.get("deal_irr")
-            lp = row.get("lp_irr")
+            lp  = row.get("lp_irr")
             cap = row.get("going_in_cap")
             dscr = row.get("dscr_yr1")
+            hist_noi = row.get("historical_noi")
             print(f"  * {row.get('property_name')} | {row.get('market')} | "
-                  f"{int(row.get('units', 0))} units | Bid: {bid_str} | "
+                  f"{int(row.get('units', 0))} units | Bid: {bid_str}{bpu_str} | "
+                  f"IRR: {irr:.1%} | LP IRR: {lp:.1%} | "
+                  f"Cap: {cap:.2%} | DSCR: {dscr:.2f}x | "
+                  f"Hist NOI: ${hist_noi:,.0f}" if hist_noi else
+                  f"  * {row.get('property_name')} | {row.get('market')} | "
+                  f"{int(row.get('units', 0))} units | Bid: {bid_str}{bpu_str} | "
                   f"IRR: {irr:.1%} | LP IRR: {lp:.1%} | "
                   f"Cap: {cap:.2%} | DSCR: {dscr:.2f}x")
 
